@@ -32,16 +32,16 @@ class PacketType:
 
 
 class ServerStatus:
-    OK = b"OK"
-    NG = b"NG"
-    SC = b"SC"
-    IM = b"IM"
-    DN = b"DN"
-    EX = b"EX"
-    DU = b"DU"
-    NF = b"NF"
-    MO = b"MO"
-    BD = b"BD"
+    OK = b"OK"  # Server reads ciphered data
+    NG = b"NG"  # Client Error
+    SC = b"SC"  # Server Error
+    IM = b"IM"  # Server in Maintenance
+    DN = b"DN"  # Account suspended temporarily
+    EX = b"EX"  # Account suspended permanently
+    DU = b"DU"  # Can't log in due to different PS2
+    NF = b"NF"  # Email user not found
+    MO = b"MO"  # Email recipient with mailbox full
+    BD = b"BD"  # Can't log in due to different PS2
 
 
 LISTEN_HOST = "0.0.0.0"
