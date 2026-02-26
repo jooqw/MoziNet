@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import utils
 from cipher import HEADER_SIZE, StreamCipherSession
 from playerman import PlayerManager
 from rankman import RankManager
@@ -46,7 +47,7 @@ class ServerStatus:
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 80
 DEFAULT_HEADER_BUFFER = b"MOZIBURIBON         "
-SESSION_TIMEOUT_SECONDS = 5 * 60
+SESSION_TIMEOUT_SECONDS = 3 * 60
 _STOP_EVENT = threading.Event()
 
 
@@ -149,6 +150,11 @@ class MojibRequestHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(content_length)
+
+            if utils.get_global_bool("SERVER_MAINTENANCE", False):
+                self._send_binary(ServerStatus.IM)
+                return
+
             if len(body) < HEADER_SIZE:
                 self._send_binary(ServerStatus.NG)
                 return
