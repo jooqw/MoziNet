@@ -16,7 +16,6 @@ import utils
 REGISTER_PAYLOAD_SIZE = 214
 LOGIN_PAYLOAD_SIZE = 246
 SCORE_PAYLOAD_SIZE = 24
-PROFILE_QA_FIELD_BYTES = [16, 32, 16, 32, 64]
 
 
 def _load_euc_checker_module():
@@ -60,45 +59,11 @@ class PlayerManager:
         self._cft = checker.load_cft_exact(cft_path)
         self._lock = threading.RLock()
 
-    def _validate_description_chunks(
-        self, description_raw: bytes
-    ) -> tuple[bool, list[str]]:
-        warnings: list[str] = []
-        valid = True
-
-        offset = 0
-        for chunk_no, field_size in enumerate(utils.PROFILE_QA_FIELD_BYTES, start=1):
-            chunk = description_raw[offset : offset + field_size]
-            offset += field_size
-
-            chunk_ok, chunk_warnings = self._validate_euc_stream(self._cft, chunk)
-            if not chunk_ok:
-                valid = False
-                warnings.extend(
-                    f"[desc chunk {chunk_no}] {w.rstrip()}" for w in chunk_warnings
-                )
-
-            # after first 0x0000 pair inside a chunk, all remaining bytes in that chunk must stay zero.
-            saw_terminator = False
-            for i in range(0, len(chunk), 2):
-                b0 = chunk[i]
-                b1 = chunk[i + 1]
-                if not saw_terminator and b0 == 0x00 and b1 == 0x00:
-                    saw_terminator = True
-                    continue
-                if saw_terminator and (b0 != 0x00 or b1 != 0x00):
-                    valid = False
-                    warnings.append(
-                        f"[desc chunk {chunk_no}] trailing non-zero bytes after 0000 terminator"
-                    )
-                    break
-
-        return valid, warnings
-
     def _player_path(self, player_id: str) -> Path:
-        safe = "".join(ch for ch in player_id if ch.isalnum() or ch in ("-", "_"))
-        if not safe:
-            safe = "unknown_player"
+        safe = (
+            "".join(ch for ch in player_id if ch.isalnum() or ch in ("-", "_"))
+            or "unknown"
+        )
         return self.players_dir / f"{safe}.json"
 
     def _load_player(self, player_id: str) -> dict[str, Any]:
@@ -106,11 +71,7 @@ class PlayerManager:
             path = self._player_path(player_id)
             if path.exists():
                 return json.loads(path.read_text(encoding="utf-8"))
-            return {"dnas_id": player_id}
-
-    def has_player(self, player_id: str) -> bool:
-        with self._lock:
-            return self._player_path(player_id).exists()
+            return {"secret_key_hex": player_id}
 
     def _save_player(self, player_id: str, data: dict[str, Any]) -> None:
         with self._lock:
@@ -120,252 +81,207 @@ class PlayerManager:
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
-    def get_player(self, player_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            path = self._player_path(player_id)
-            if not path.exists():
-                return None
-            return json.loads(path.read_text(encoding="utf-8"))
+    def _validate_description_chunks(
+        self, description_raw: bytes
+    ) -> tuple[bool, list[str]]:
+        warnings, valid = [], True
+        offset = 0
+        for i, field_size in enumerate(utils.PROFILE_QA_FIELD_BYTES, 1):
+            chunk = description_raw[offset : offset + field_size]
+            offset += field_size
 
-    def apply_stage_put_player_info(
+            ok, chunk_warnings = self._validate_euc_stream(self._cft, chunk)
+            if not ok:
+                valid = False
+                warnings.extend(
+                    f"[desc chunk {i}] {w.rstrip()}" for w in chunk_warnings
+                )
+
+            if b"\x00\x00" in chunk:
+                _, trailing = chunk.split(b"\x00\x00", 1)
+                if any(b != 0 for b in trailing):
+                    valid = False
+                    warnings.append(
+                        f"[desc chunk {i}] trailing non-zero bytes after terminator"
+                    )
+        return valid, warnings
+
+    def _parse_and_update_player(
         self,
         player_id: str,
-        *,
-        user_score: int,
-        user_dan: int,
-        beaten_stages: int,
-        toku_sent_mail: int,
-        retrieved_toku: int,
-    ) -> None:
+        dnas: bytes,
+        name: bytes,
+        dan: bytes,
+        desc: bytes,
+        toku: bytes,
+    ) -> tuple[bool, list[str]]:
+
+        valid_desc, warnings = self._validate_description_chunks(desc)
+
         player = self._load_player(player_id)
-        player["hesori_toku"] = int(user_score) & 0xFFFFFFFF
-        player["dan"] = int(user_dan) & 0xFFFF
+        player.update(
+            {
+                "dnas_id": utils.trim_zero(dnas).decode("ascii", errors="ignore"),
+                "player_name": utils.decode_euc_jp_safe(name),
+                "dan": int.from_bytes(dan, "little") & 0xFFFF,
+                "hesori_toku": int.from_bytes(toku, "little") & 0xFFFFFFFF,
+                "profile_qa": utils.parse_profile_qa_fields(desc),
+                "description_valid_euc_jp": valid_desc,
+                "banned_permanent": player.get("banned_permanent", False),
+                "temp_ban_seconds": player.get("temp_ban_seconds", 0),
+                "temp_ban_started_at": player.get("temp_ban_started_at", 0),
+            }
+        )
+
+        self._save_player(player_id, player)
+        return valid_desc, warnings
+
+    def has_player(self, player_id: str) -> bool:
+        return self._player_path(player_id).exists()
+
+    def get_player(self, player_id: str) -> dict[str, Any] | None:
+        return self._load_player(player_id) if self.has_player(player_id) else None
+
+    def handle_register(self, payload: bytes) -> RegisterResult:
+        if len(payload) < REGISTER_PAYLOAD_SIZE:
+            raise ValueError("Payload too short")
+
+        secret_key = os.urandom(16)
+        player_id = secret_key.hex()
+        email_raw = utils.build_unique_mail_field()
+
+        valid, warnings = self._parse_and_update_player(
+            player_id,
+            payload[0:32],
+            payload[32:48],
+            payload[48:50],
+            payload[50:210],
+            payload[210:214],
+        )
+
+        player = self._load_player(player_id)
+        player["email_hiragana"] = utils.decode_euc_jp_safe(email_raw)
+        self._save_player(player_id, player)
+
+        return RegisterResult(player_id, valid, warnings, email_raw + secret_key)
+
+    def handle_login(self, payload: bytes) -> LoginResult:
+        if len(payload) < LOGIN_PAYLOAD_SIZE:
+            raise ValueError("Payload too short")
+
+        email = utils.decode_euc_jp_safe(payload[0:16])
+        player_id = payload[16:32].hex()
+
+        if not self.has_player(player_id) and not utils.get_global_bool(
+            "ALLOW_LOGIN_RECOVERY_IF_PLAYER_MISSING", True
+        ):
+            raise ValueError("Unknown secret key")
+
+        valid, warnings = self._parse_and_update_player(
+            player_id,
+            payload[32:64],
+            payload[64:80],
+            payload[80:82],
+            payload[82:242],
+            payload[242:246],
+        )
+
+        return LoginResult(player_id, email, player_id, valid, warnings)
+
+    def handle_score(self, player_id: str, payload: bytes) -> dict[str, int]:
+        if len(payload) < SCORE_PAYLOAD_SIZE:
+            raise ValueError("Payload too short")
+
+        vals = [int.from_bytes(payload[i : i + 4], "little") for i in range(0, 24, 4)]
+        score = {
+            "hesori_toku": vals[0],
+            "stages_beaten_toku": vals[1],
+            "dan": vals[2],
+            "stages_beaten": vals[3],
+            "toku_sent_email": vals[4],
+            "retrieved_score_toku": vals[5],
+        }
+
+        player = self._load_player(player_id)
+        player["hesori_toku"] = score["hesori_toku"]
+        player["dan"] = score["dan"] & 0xFFFF
         player["score_last"] = {
-            "stages_beaten": int(beaten_stages) & 0xFFFFFFFF,
-            "toku_sent_email": int(toku_sent_mail) & 0xFFFFFFFF,
-            "retrieved_score_toku": int(retrieved_toku) & 0xFFFFFFFF,
+            k: v for k, v in score.items() if k not in ("hesori_toku", "dan")
         }
         self._save_player(player_id, player)
-
-    def add_hesori_toku(self, player_id: str, delta: int) -> None:
-        player = self._load_player(player_id)
-        current = int(player.get("hesori_toku", 0) or 0)
-        player["hesori_toku"] = (current + int(delta)) & 0xFFFFFFFF
-        self._save_player(player_id, player)
+        return score
 
     def add_retrieve_result(
-        self, player_id: str, *, gained_toku: int = 0, returned_toku: int = 0
+        self, player_id: str, gained_toku: int = 0, returned_toku: int = 0
     ) -> None:
         player = self._load_player(player_id)
-        current_gained = int(player.get("retrieve_pending_gained_toku", 0) or 0)
-        current_returned = int(player.get("retrieve_pending_returned_toku", 0) or 0)
         player["retrieve_pending_gained_toku"] = (
-            current_gained + int(gained_toku)
+            player.get("retrieve_pending_gained_toku", 0) + gained_toku
         ) & 0xFFFFFFFF
         player["retrieve_pending_returned_toku"] = (
-            current_returned + int(returned_toku)
+            player.get("retrieve_pending_returned_toku", 0) + returned_toku
         ) & 0xFFFFFFFF
         self._save_player(player_id, player)
 
     def consume_retrieve_payload(self, player_id: str) -> bytes:
         player = self._load_player(player_id)
-        gained = int(player.get("retrieve_pending_gained_toku", 0) or 0) & 0xFFFFFFFF
-        returned = (
-            int(player.get("retrieve_pending_returned_toku", 0) or 0) & 0xFFFFFFFF
-        )
-        player["retrieve_pending_gained_toku"] = 0
-        player["retrieve_pending_returned_toku"] = 0
+        g = player.pop("retrieve_pending_gained_toku", 0) & 0xFFFFFFFF
+        r = player.pop("retrieve_pending_returned_toku", 0) & 0xFFFFFFFF
         self._save_player(player_id, player)
-        return gained.to_bytes(4, "little", signed=False) + returned.to_bytes(
-            4, "little", signed=False
-        )
+        return g.to_bytes(4, "little") + r.to_bytes(4, "little")
 
-    def handle_register(self, payload_without_command: bytes) -> RegisterResult:
-        if len(payload_without_command) < REGISTER_PAYLOAD_SIZE:
-            raise ValueError(
-                f"REGISTER payload too short: got={len(payload_without_command)} need={REGISTER_PAYLOAD_SIZE}"
-            )
-
-        dnas_raw = payload_without_command[0:32]
-        name_raw = payload_without_command[32:48]
-        dan_raw = payload_without_command[48:50]
-        description_raw = payload_without_command[50:210]
-        total_toku_raw = payload_without_command[210:214]
-
-        player_name = utils.decode_euc_jp_safe(name_raw)
-        email_raw = utils.build_unique_mail_field()
-        email = utils.decode_euc_jp_safe(email_raw)
-        secret_key_raw = os.urandom(16)
-        secret_key_hex = secret_key_raw.hex()
-        player_id = secret_key_hex
-        dan = int.from_bytes(dan_raw, "little", signed=False)
-        hesori_toku = int.from_bytes(total_toku_raw, "little", signed=False)
-
-        valid_description, warnings = self._validate_description_chunks(description_raw)
-        if not valid_description:
-            for warning in warnings:
-                print(warning)
-
-        profile_qa = utils.parse_profile_qa_fields(description_raw)
-
+    def apply_stage_put_player_info(self, player_id: str, **kwargs) -> None:
         player = self._load_player(player_id)
-        player["secret_key_hex"] = secret_key_hex
-        player["dnas_id"] = utils.trim_zero(dnas_raw).decode("ascii", errors="ignore")
-        player["player_name"] = player_name
-        player["email_hiragana"] = email
-        player["dan"] = dan
-        player["hesori_toku"] = hesori_toku
-        player["description_valid_euc_jp"] = bool(valid_description)
-        player["profile_qa"] = profile_qa
-        player["banned_permanent"] = bool(player.get("banned_permanent", False))
-        player["temp_ban_seconds"] = int(player.get("temp_ban_seconds", 0) or 0)
-        player["temp_ban_started_at"] = int(player.get("temp_ban_started_at", 0) or 0)
-
-        self._save_player(player_id, player)
-        return RegisterResult(
-            player_id=player_id,
-            valid_description=bool(valid_description),
-            warnings=warnings,
-            reply_payload=email_raw + secret_key_raw,
-        )
-
-    def handle_login(self, payload_without_command: bytes) -> LoginResult:
-        if len(payload_without_command) < LOGIN_PAYLOAD_SIZE:
-            raise ValueError(
-                f"LOGIN payload too short: got={len(payload_without_command)} need={LOGIN_PAYLOAD_SIZE}"
-            )
-
-        email_raw = payload_without_command[0:16]
-        secret_key_raw = payload_without_command[16:32]
-        dnas_raw = payload_without_command[32:64]
-        name_raw = payload_without_command[64:80]
-        dan_raw = payload_without_command[80:82]
-        description_raw = payload_without_command[82:242]
-        total_toku_raw = payload_without_command[242:246]
-
-        email = utils.decode_euc_jp_safe(email_raw)
-        secret_key_hex = secret_key_raw.hex()
-        player_id = secret_key_hex
-        player_exists = self.has_player(player_id)
-        if not player_exists and not utils.get_global_bool(
-            "ALLOW_LOGIN_RECOVERY_IF_PLAYER_MISSING", True
-        ):
-            raise ValueError("LOGIN rejected: unknown secret key")
-        player_name = utils.decode_euc_jp_safe(name_raw)
-        dan = int.from_bytes(dan_raw, "little", signed=False)
-        hesori_toku = int.from_bytes(total_toku_raw, "little", signed=False)
-
-        valid_description, warnings = self._validate_description_chunks(description_raw)
-        if not valid_description:
-            for warning in warnings:
-                print(warning)
-
-        profile_qa = utils.parse_profile_qa_fields(description_raw)
-
-        player = self._load_player(player_id) if player_exists else {}
-        player["secret_key_hex"] = secret_key_hex
-        player["dnas_id"] = utils.trim_zero(dnas_raw).decode("ascii", errors="ignore")
-        player["player_name"] = player_name
-        player["email_hiragana"] = email
-        player["dan"] = dan
-        player["hesori_toku"] = hesori_toku
-        player["description_valid_euc_jp"] = bool(valid_description)
-        player["profile_qa"] = profile_qa
-        player["banned_permanent"] = bool(player.get("banned_permanent", False))
-        player["temp_ban_seconds"] = int(player.get("temp_ban_seconds", 0) or 0)
-        player["temp_ban_started_at"] = int(player.get("temp_ban_started_at", 0) or 0)
-        self._save_player(player_id, player)
-
-        return LoginResult(
-            player_id=player_id,
-            email=email,
-            secret_key_hex=secret_key_hex,
-            valid_description=bool(valid_description),
-            warnings=warnings,
-        )
-
-    def handle_score(
-        self, player_id: str, payload_without_command: bytes
-    ) -> dict[str, int]:
-        if len(payload_without_command) < SCORE_PAYLOAD_SIZE:
-            raise ValueError(
-                f"SCORE payload too short: got={len(payload_without_command)} need={SCORE_PAYLOAD_SIZE}"
-            )
-
-        values = [
-            int.from_bytes(payload_without_command[i : i + 4], "little", signed=False)
-            for i in range(0, SCORE_PAYLOAD_SIZE, 4)
-        ]
-
-        score = {
-            "hesori_toku": values[0],
-            "stages_beaten_toku": values[1], # guess
-            "dan": values[2],
-            "stages_beaten": values[3],
-            "toku_sent_email": values[4],
-            "retrieved_score_toku": values[5],
-        }
-
-        player = self._load_player(player_id)
+        player["hesori_toku"] = kwargs.get("user_score", 0) & 0xFFFFFFFF
+        player["dan"] = kwargs.get("user_dan", 0) & 0xFFFF
         player["score_last"] = {
-            "stages_beaten_toku": score["stages_beaten_toku"],
-            "stages_beaten": score["stages_beaten"],
-            "toku_sent_email": score["toku_sent_email"],
-            "retrieved_score_toku": score["retrieved_score_toku"],
+            "stages_beaten": kwargs.get("beaten_stages", 0),
+            "toku_sent_email": kwargs.get("toku_sent_mail", 0),
+            "retrieved_score_toku": kwargs.get("retrieved_toku", 0),
         }
-        player["hesori_toku"] = score["hesori_toku"]
-        player["dan"] = score["dan"]
         self._save_player(player_id, player)
-        return score
-
-    def list_players(self) -> list[dict[str, Any]]:
-        with self._lock:
-            players: list[dict[str, Any]] = []
-            for path in self.players_dir.glob("*.json"):
-                try:
-                    players.append(json.loads(path.read_text(encoding="utf-8")))
-                except Exception:
-                    continue
-            return players
 
     def find_player_id_by_email(self, email: str) -> str | None:
-        target = str(email or "")
         with self._lock:
             for path in self.players_dir.glob("*.json"):
                 try:
-                    player = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if data.get("email_hiragana") == email:
+                        return data.get("secret_key_hex")
+                except:
                     continue
-                if str(player.get("email_hiragana", "")) == target:
-                    pid = str(player.get("secret_key_hex", "") or "")
-                    if pid:
-                        return pid
-            return None
+        return None
 
     def get_account_restriction_status(self, player_id: str) -> bytes:
         player = self.get_player(player_id)
-        if player is None:
+        if not player:
             return b"OK"
-
-        if bool(player.get("banned_permanent", False) or player.get("banned", False)):
+        if player.get("banned_permanent") or player.get("banned"):
             return b"EX"
 
-        temp_ban_seconds = int(player.get("temp_ban_seconds", 0) or 0)
-        if temp_ban_seconds <= 0:
+        sec = int(player.get("temp_ban_seconds", 0))
+        if sec <= 0:
             return b"OK"
 
-        started_at = int(player.get("temp_ban_started_at", 0) or 0)
-        if started_at <= 0:
+        start = int(player.get("temp_ban_started_at", 0))
+        if start <= 0:
             player["temp_ban_started_at"] = int(time.time())
             self._save_player(player_id, player)
             return b"DN"
 
-        now = int(time.time())
-        if now < started_at + temp_ban_seconds:
+        if time.time() < (start + sec):
             return b"DN"
 
-        # Auto-clear expired temporary bans.
-        player["temp_ban_seconds"] = 0
-        player["temp_ban_started_at"] = 0
+        player.update({"temp_ban_seconds": 0, "temp_ban_started_at": 0})
         self._save_player(player_id, player)
         return b"OK"
+
+    def list_players(self) -> list[dict[str, Any]]:
+        with self._lock:
+            players = []
+            for path in self.players_dir.glob("*.json"):
+                try:
+                    players.append(json.loads(path.read_text(encoding="utf-8")))
+                except:
+                    continue
+            return players
