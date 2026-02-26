@@ -167,10 +167,11 @@ class StageManager:
             if s.is_mail and s.owner_id == owner_id:
                 if (now - s.date_created_ms) > MAIL_EXPIRY_MS:
                     player_manager.add_retrieve_result(
-                        owner_id, returned_toku=s.attachment_toku
+                        owner_id,
+                        gained_toku=0,
+                        returned_toku=s.attachment_toku,
                     )
                     to_delete.append(sid)
-
         if to_delete:
             for sid in to_delete:
                 self._delete_stage(sid)
@@ -248,7 +249,7 @@ class StageManager:
                 raise ValueError("Stage not found")
 
             player_manager.add_retrieve_result(
-                stage.owner_id, gained_toku=0, returned_toku=STAGE_DOWNLOAD_REWARD_TOKU
+                stage.owner_id, gained_toku=STAGE_DOWNLOAD_REWARD_TOKU, returned_toku=0
             )
             return self._verify_and_read_files(stage)
 
