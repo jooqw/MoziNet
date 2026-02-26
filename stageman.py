@@ -42,7 +42,7 @@ class Stage:
     win_cutscene_type: int = 0
     flag2: int = 0
     flag4: int = 0
-    hardcoded1: int = 1
+    IsCustom: int = 1
     unk_numeric3: int = 0
     retrieved_toku: int = 0
     date_created_ms: int = 0
@@ -88,7 +88,7 @@ class Stage:
         buf[237:241] = int(self.unk_value).to_bytes(4, "little", signed=True)
         buf[241] = self.win_cutscene_type & 0xFF
         buf[242] = self.flag4 & 0xFF
-        buf[243] = self.hardcoded1 & 0xFF
+        buf[243] = self.IsCustom & 0xFF
         buf[244:248] = int(self.unk_numeric3).to_bytes(4, "little", signed=False)
         buf[248:280] = utils.encode_euc_jp_fixed(self.description, 32)
 
@@ -207,7 +207,7 @@ class StageManager:
             win_cutscene_type=stage_blob[38],
             flag2=stage_blob[39],
             flag4=stage_blob[39],
-            hardcoded1=stage_blob[40],
+            IsCustom=stage_blob[40],
             source_hash=source_hash,
             **kwargs,
         )
