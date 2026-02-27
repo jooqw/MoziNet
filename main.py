@@ -280,7 +280,9 @@ class MojibRequestHandler(BaseHTTPRequestHandler):
                         )
                     case PacketType.DLNOTIFY:
                         print("ECHO(DLNOTIFY)")
-                        reply_payload = data
+                        reply_payload = (
+                            data[:1] if data else bytes([PacketType.DLNOTIFY])
+                        )
                     case _:
                         print(f"[conn] command={command} not implemented")
                         status = ServerStatus.NG
